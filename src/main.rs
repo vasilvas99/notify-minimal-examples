@@ -1,23 +1,26 @@
-use futures::{
-    channel::mpsc::{channel, Receiver},
-    SinkExt, StreamExt, Future,
-};
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher, Config};
-use std::{path::Path, time::Duration};
+use tokio::sync::mpsc::{channel, Receiver};
+use notify::{Event, PollWatcher, RecursiveMode, Watcher, Config};
+use std::{path::{Path, PathBuf}, time::Duration};
+use std::future::Future;
 
-use std::error::Error;
+const POLL_SECONDS: f64 = 2.0;
 
 /// Directly taken from the notify async watcher example with slight modifications
-fn async_watcher() -> notify::Result<(RecommendedWatcher, Receiver<notify::Result<Event>>)> {
-    let (mut tx, rx) = channel(1);
+fn async_watcher() -> notify::Result<(PollWatcher, Receiver<notify::Result<Event>>)> {
+    let (tx, rx) = channel(1);
 
 
-    let watcher = RecommendedWatcher::new(move |res| {
-        futures::executor::block_on(async {
+    let config = Config::default()
+    .with_poll_interval(Duration::from_secs_f64(POLL_SECONDS))
+    .with_compare_contents(true);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let watcher = PollWatcher::new(move |res| {
+        rt.block_on(async {
             tx.send(res).await.unwrap();
         })
-    }, Config::default())?;
-
+    }, config)?;
     Ok((watcher, rx))
 }
 
@@ -27,31 +30,45 @@ where
     F: Fn(Event) -> Fut,
     Fut: Future<Output = ()>
 {
-    let config = Config::default()
-    .with_poll_interval(Duration::from_secs(65))
-    .with_compare_contents(false);
-
     let (mut watcher, mut rx) = async_watcher()?;
-    watcher.configure(config).unwrap();
+
     watcher.watch(path.as_ref(), RecursiveMode::Recursive)?;
 
-    while let Some(event) = rx.next().await {
+    while let Some(event) = rx.recv().await {
         callback(event?).await
     }
 
     Ok(())
 }
 
+fn is_json(path: &PathBuf) -> bool {
+
+    if path.extension().is_none() {
+        return false
+    } 
+
+    if path.extension().unwrap() == "json" {
+        return true
+    }
+
+    return false
+}
+
 async fn print_event(e: Event) {
-    if e.kind.is_modify() {
-        for path in e.paths {
-            println!("File at path {} modified", path.display())
+    for path in &e.paths {
+        if is_json(path) {
+            if e.kind.is_create() || e.kind.is_modify() {
+                println!("Redeploying...")
+            } else {
+                println!("Not Redeploying...")
+
+            }
         }
     }
 }
 
 #[tokio::main]
-pub async fn main() -> Result<(), Box<dyn Error>> {
+pub async fn main() -> notify::Result<()> {
     let path = std::env::args()
         .nth(1)
         .expect("Argument 1 needs to be a path");
